@@ -15,6 +15,7 @@ package com.facebook.presto.metadata;
 
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.connector.ConnectorManager;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -113,7 +114,7 @@ public class StaticCatalogStore
                 connectorName = entry.getValue();
             }
             else {
-                connectorProperties.put(entry.getKey(), entry.getValue());
+                connectorProperties.put(entry.getKey(), substitutePlaceHolder(entry.getValue()));
             }
         }
 
@@ -121,6 +122,22 @@ public class StaticCatalogStore
 
         connectorManager.createConnection(catalogName, connectorName, connectorProperties.build());
         log.info("-- Added catalog %s using connector %s --", catalogName, connectorName);
+    }
+
+    @VisibleForTesting
+    static String substitutePlaceHolder(String propertyValue)
+    {
+        if (propertyValue.startsWith("${") && propertyValue.endsWith("}")) {
+            String envVariable = propertyValue.substring(2, propertyValue.length() - 1);
+            String envValue = System.getenv(envVariable);
+            if (envValue != null) {
+                log.info("Substituting [%s] property using the value of the [%s] environment variable", propertyValue, envVariable);
+                return envValue;
+            }
+            log.error("Unable to find env variable [%s] corresponding to property value [%s]", envVariable, propertyValue);
+            throw new RuntimeException(String.format("Unable to find env variable [%s] corresponding to property value [%s]", envVariable, propertyValue));
+        }
+        return propertyValue;
     }
 
     private static List<File> listFiles(File installedPluginsDir)
