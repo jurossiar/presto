@@ -36,6 +36,11 @@ RUN --mount=type=cache,target=/root/.ccache,sharing=locked \
 RUN !(LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib:/usr/local/lib64 ldd /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/presto_cpp/main/presto_server  | grep "not found" | grep -v "libnvidia-ml") && \
     LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib:/usr/local/lib64 ldd /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/presto_cpp/main/presto_server | awk 'NF == 4 { system("cp " $3 " /runtime-libraries") }'
 
+# Record the CUDA version the dependency image was built with, so the runtime
+# stage installs a matching runtime. Last instruction of this stage on purpose:
+# it must not invalidate the cached compile above.
+RUN echo "${CUDA_VERSION}" > /cuda_version
+
 #/////////////////////////////////////////////
 #          prestissimo-runtime
 #//////////////////////////////////////////////
@@ -44,6 +49,21 @@ FROM ${BASE_IMAGE}
 
 ENV BUILD_BASE_DIR=_build
 ENV BUILD_DIR=""
+
+# cuDF reaches NVRTC and nvJitLink through dlopen, building the version suffix at
+# run time, so neither shows up as a NEEDED entry of presto_server or libcudf and
+# the ldd sweep above cannot copy them. Without this the worker starts and then
+# fails once a query needs a JIT-compiled kernel. The NVIDIA container runtime
+# injects the driver (libcuda, libnvidia-ml) but not the CUDA toolkit libraries,
+# so they have to be in the image.
+COPY --from=prestissimo-image /prestissimo/velox/scripts/ /tmp/scripts/
+COPY --from=prestissimo-image /cuda_version /tmp/
+RUN CUDA_VERSION=$(cat /tmp/cuda_version) && \
+    source /tmp/scripts/setup-centos-adapters.sh && \
+    install_cuda_runtime "${CUDA_VERSION}" && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf /tmp/scripts /tmp/cuda_version
+RUN echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf
 
 COPY --chmod=0775 --from=prestissimo-image /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/presto_cpp/main/presto_server /usr/bin/
 COPY --chmod=0775 --from=prestissimo-image /runtime-libraries/* /usr/lib64/prestissimo-libs/
