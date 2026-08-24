@@ -71,4 +71,15 @@ COPY --chmod=0755 ./etc /opt/presto-server/etc
 COPY --chmod=0775 ./entrypoint.sh /opt/entrypoint.sh
 RUN echo "/usr/lib64/prestissimo-libs" > /etc/ld.so.conf.d/prestissimo.conf && ldconfig
 
+# cuDF JIT-compiles kernels with NVRTC using --pch, and NVRTC resolves the
+# precompiled header name 'kernel.pch' against the process working directory. The
+# default would be '/', which is not writable when the container runs as an
+# arbitrary UID (OpenShift's restricted SCC), so every JIT compilation fails with
+# "cannot open precompiled header file" and the operators that need it report
+# 'Broken promise'. /tmp is writable for any UID and is already where libcudf
+# keeps its kernel bundle. Nothing resolves paths relative to the working
+# directory - entrypoint.sh passes --etc-dir absolute - so this is inert
+# otherwise.
+WORKDIR /tmp
+
 ENTRYPOINT ["/opt/entrypoint.sh"]
