@@ -32,31 +32,46 @@ namespace {
 // to the cgroup's own directory under the mount root.
 constexpr const char* kCgroupV2UsageFile = "cpu.stat";
 constexpr const char* kCgroupV2QuotaFile = "cpu.max";
-constexpr const char* kCgroupMountRoot = "/sys/fs/cgroup";
+constexpr const char* const kCgroupV2Dirs[] = {"/sys/fs/cgroup"};
 
 // cgroup v1 splits the accounting across the 'cpuacct' and 'cpu' controllers,
-// which may be mounted separately or together.
-constexpr const char* const kCgroupV1UsageFiles[] = {
-    "/sys/fs/cgroup/cpuacct/cpuacct.usage",
-    "/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"};
-constexpr const char* const kCgroupV1QuotaFiles[] = {
-    "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
-    "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us"};
-constexpr const char* const kCgroupV1PeriodFiles[] = {
-    "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
-    "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us"};
+// which may be mounted separately or together, and which can sit at different
+// paths in the hierarchy.
+constexpr const char* kCgroupV1UsageFile = "cpuacct.usage";
+constexpr const char* kCgroupV1QuotaFile = "cpu.cfs_quota_us";
+constexpr const char* kCgroupV1PeriodFile = "cpu.cfs_period_us";
+constexpr const char* const kCgroupV1UsageDirs[] = {
+    "/sys/fs/cgroup/cpuacct",
+    "/sys/fs/cgroup/cpu,cpuacct"};
+constexpr const char* const kCgroupV1QuotaDirs[] = {
+    "/sys/fs/cgroup/cpu",
+    "/sys/fs/cgroup/cpu,cpuacct"};
 
 bool fileExists(const std::string& path) {
   struct stat buffer;
   return !path.empty() && stat(path.c_str(), &buffer) == 0;
 }
 
-// Returns the first of 'candidates' that exists, or an empty string.
+// Returns the directory the CPU accounting should be read from: the first of
+// 'dirs' that holds 'probe', preferring '<dir><relative>' over '<dir>' so a
+// process in a nested cgroup reads its own accounting rather than the mount
+// root's. Empty when 'probe' is nowhere to be found.
 template <size_t N>
-std::string firstExisting(const char* const (&candidates)[N]) {
-  for (const auto* candidate : candidates) {
-    if (fileExists(candidate)) {
-      return candidate;
+std::string findCgroupDir(
+    const char* const (&dirs)[N],
+    const std::string& relative,
+    const char* probe) {
+  if (!relative.empty()) {
+    for (const auto* dir : dirs) {
+      const auto nested = dir + relative;
+      if (fileExists(fmt::format("{}/{}", nested, probe))) {
+        return nested;
+      }
+    }
+  }
+  for (const auto* dir : dirs) {
+    if (fileExists(fmt::format("{}/{}", dir, probe))) {
+      return dir;
     }
   }
   return "";
@@ -112,11 +127,31 @@ static bool readProcStat(std::vector<uint64_t>& counters) {
   return true;
 }
 
-std::string CPUMon::parseCgroupV2RelativePath(const std::string& procSelf) {
-  // Lines are '<hierarchy-id>:<controllers>:<path>'. The cgroup v2 entry is the
-  // one with an empty controller list. A cgroup path may itself contain a
-  // colon, so the fields are split by position rather than by counting
-  // separators.
+namespace {
+
+// True when 'controllers' - the comma-separated second field of a
+// '/proc/self/cgroup' line - is the entry being looked for. An empty 'wanted'
+// selects the cgroup v2 entry, whose controller list is empty by definition.
+bool matchesController(
+    folly::StringPiece controllers,
+    folly::StringPiece wanted) {
+  if (wanted.empty()) {
+    return controllers.empty();
+  }
+  std::vector<folly::StringPiece> names;
+  folly::split(',', controllers, names);
+  return std::find(names.begin(), names.end(), wanted) != names.end();
+}
+
+} // namespace
+
+std::string CPUMon::parseCgroupRelativePath(
+    const std::string& procSelf,
+    folly::StringPiece controller) {
+  // Lines are '<hierarchy-id>:<controllers>:<path>'. The cgroup v2 entry has an
+  // empty controller list; a v1 entry lists its controllers comma-separated. A
+  // cgroup path may itself contain a colon, so the fields are split by position
+  // rather than by counting separators.
   std::vector<folly::StringPiece> lines;
   folly::split('\n', procSelf, lines);
   for (const auto& line : lines) {
@@ -124,10 +159,16 @@ std::string CPUMon::parseCgroupV2RelativePath(const std::string& procSelf) {
     if (firstColon == std::string::npos) {
       continue;
     }
-    if (line.find(':', firstColon + 1) != firstColon + 1) {
+    const auto secondColon = line.find(':', firstColon + 1);
+    if (secondColon == std::string::npos) {
       continue;
     }
-    const auto path = folly::trimWhitespace(line.subpiece(firstColon + 2));
+    const auto controllers =
+        line.subpiece(firstColon + 1, secondColon - firstColon - 1);
+    if (!matchesController(controllers, controller)) {
+      continue;
+    }
+    const auto path = folly::trimWhitespace(line.subpiece(secondColon + 1));
     // The root cgroup adds no prefix, and is what a container started with
     // 'cgroupns=private' sees for its own cgroup.
     return path == "/" ? "" : path.str();
@@ -136,40 +177,49 @@ std::string CPUMon::parseCgroupV2RelativePath(const std::string& procSelf) {
 }
 
 void CPUMon::detectCgroupFiles() {
+  // With 'cgroupns=host' the mount roots describe the whole machine rather than
+  // this container, so the process' own cgroup path has to be appended. With
+  // 'cgroupns=private' the process already sees its own cgroup as the root and
+  // /proc/self/cgroup reports '/', leaving nothing to append. Reading the file
+  // is best effort: an unreadable one leaves the paths empty and the mount
+  // roots are used, which is the right answer in the common case.
+  std::string procSelf;
+  folly::readFile("/proc/self/cgroup", procSelf);
+
   // cgroup v2 first: a host running it has no v1 controller directories, while
-  // a host running v1 has no 'cpu.max' at the mount root.
-  const std::string v2Root = kCgroupMountRoot;
-  if (fileExists(fmt::format("{}/{}", v2Root, kCgroupV2QuotaFile))) {
+  // a host running v1 has no 'cpu.max' under the mount root.
+  const auto v2Dir = findCgroupDir(
+      kCgroupV2Dirs, parseCgroupRelativePath(procSelf, ""), kCgroupV2QuotaFile);
+  if (!v2Dir.empty()) {
     cgroupV2_ = true;
-    // With 'cgroupns=host' the mount root describes the whole machine rather
-    // than this container, so prefer our own cgroup's directory when the
-    // kernel tells us where it is. With 'cgroupns=private' the process already
-    // sees its own cgroup as the root and there is no prefix to add.
-    std::string base = v2Root;
-    std::string procSelf;
-    if (folly::readFile("/proc/self/cgroup", procSelf)) {
-      const auto relative = parseCgroupV2RelativePath(procSelf);
-      if (!relative.empty() &&
-          fileExists(
-              fmt::format("{}{}/{}", v2Root, relative, kCgroupV2QuotaFile))) {
-        base = v2Root + relative;
-      }
-    }
-    const auto usageFile = fmt::format("{}/{}", base, kCgroupV2UsageFile);
+    const auto usageFile = fmt::format("{}/{}", v2Dir, kCgroupV2UsageFile);
     if (fileExists(usageFile)) {
       cgroupUsageFile_ = usageFile;
-      cgroupQuotaFile_ = fmt::format("{}/{}", base, kCgroupV2QuotaFile);
+      cgroupQuotaFile_ = fmt::format("{}/{}", v2Dir, kCgroupV2QuotaFile);
     }
   } else {
     cgroupV2_ = false;
-    cgroupUsageFile_ = firstExisting(kCgroupV1UsageFiles);
-    cgroupQuotaFile_ = firstExisting(kCgroupV1QuotaFiles);
-    cgroupPeriodFile_ = firstExisting(kCgroupV1PeriodFiles);
-    if (cgroupUsageFile_.empty() || cgroupQuotaFile_.empty() ||
-        cgroupPeriodFile_.empty()) {
-      cgroupUsageFile_.clear();
-      cgroupQuotaFile_.clear();
-      cgroupPeriodFile_.clear();
+    // 'cpuacct' and 'cpu' are separate v1 controllers and can sit at different
+    // paths in the hierarchy, so each is resolved against its own entry.
+    const auto usageDir = findCgroupDir(
+        kCgroupV1UsageDirs,
+        parseCgroupRelativePath(procSelf, "cpuacct"),
+        kCgroupV1UsageFile);
+    const auto quotaDir = findCgroupDir(
+        kCgroupV1QuotaDirs,
+        parseCgroupRelativePath(procSelf, "cpu"),
+        kCgroupV1QuotaFile);
+    if (!usageDir.empty() && !quotaDir.empty()) {
+      cgroupUsageFile_ = fmt::format("{}/{}", usageDir, kCgroupV1UsageFile);
+      cgroupQuotaFile_ = fmt::format("{}/{}", quotaDir, kCgroupV1QuotaFile);
+      const auto periodFile =
+          fmt::format("{}/{}", quotaDir, kCgroupV1PeriodFile);
+      if (fileExists(periodFile)) {
+        cgroupPeriodFile_ = periodFile;
+      } else {
+        cgroupUsageFile_.clear();
+        cgroupQuotaFile_.clear();
+      }
     }
   }
 
@@ -246,8 +296,7 @@ double CPUMon::readCgroupCpuQuotaCores() const {
     // for 'no limit set'.
     const auto quota = parseSingleValue(content);
     std::string periodContent;
-    if (!quota.hasValue() ||
-        !readSmallFile(cgroupPeriodFile_, periodContent)) {
+    if (!quota.hasValue() || !readSmallFile(cgroupPeriodFile_, periodContent)) {
       return 0;
     }
     const auto period = parseSingleValue(periodContent);

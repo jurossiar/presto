@@ -13,6 +13,7 @@
  */
 #pragma once
 
+#include <folly/Range.h>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -59,12 +60,17 @@ class CPUMon {
       int64_t elapsedUsec,
       double quotaCores);
 
-  /// Returns the cgroup v2 path of the current process relative to the cgroup
-  /// mount root, parsed out of the contents of '/proc/self/cgroup'. Empty when
+  /// Returns the path of the current process' cgroup relative to the controller
+  /// mount root, parsed out of the contents of '/proc/self/cgroup'.
+  /// 'controller' names the cgroup v1 controller to look for ('cpu' or
+  /// 'cpuacct'); pass an empty string for cgroup v2, whose entry has no
+  /// controller list. Empty when
   /// the process is in the root cgroup - which is what a container started with
   /// 'cgroupns=private' reports, as the kernel shows it its own cgroup as the
-  /// root - or when the contents hold no v2 line. Exposed for testing.
-  static std::string parseCgroupV2RelativePath(const std::string& procSelf);
+  /// root - or when no matching entry is present. Exposed for testing.
+  static std::string parseCgroupRelativePath(
+      const std::string& procSelf,
+      folly::StringPiece controller);
 
   /// Overrides the files the cgroup accounting is read from. 'periodFile' is
   /// only used for cgroup v1, where the quota and the period live in separate

@@ -225,7 +225,7 @@ TEST_F(CPUMonTest, loadPctUnknown) {
 TEST_F(CPUMonTest, cgroupV2PathPrivateNamespace) {
   // A container started with 'cgroupns=private' sees its own cgroup as the
   // root, so the files at the mount root are already the right ones.
-  ASSERT_EQ(CPUMon::parseCgroupV2RelativePath("0::/\n"), "");
+  ASSERT_EQ(CPUMon::parseCgroupRelativePath("0::/\n", ""), "");
 }
 
 TEST_F(CPUMonTest, cgroupV2PathHostNamespace) {
@@ -234,21 +234,22 @@ TEST_F(CPUMonTest, cgroupV2PathHostNamespace) {
   const std::string path =
       "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice"
       "/cri-containerd-abc.scope";
-  ASSERT_EQ(CPUMon::parseCgroupV2RelativePath("0::" + path + "\n"), path);
+  ASSERT_EQ(CPUMon::parseCgroupRelativePath("0::" + path + "\n", ""), path);
 }
 
 TEST_F(CPUMonTest, cgroupV2PathAmongV1Entries) {
   // On a host running cgroup v1, or in the hybrid layout, only the entry with
   // an empty controller list is the v2 one.
   ASSERT_EQ(
-      CPUMon::parseCgroupV2RelativePath(
+      CPUMon::parseCgroupRelativePath(
           "12:cpu,cpuacct:/kubepods/pod123\n"
           "11:memory:/kubepods/pod123\n"
-          "0::/kubepods/pod123\n"),
+          "0::/kubepods/pod123\n",
+          ""),
       "/kubepods/pod123");
   ASSERT_EQ(
-      CPUMon::parseCgroupV2RelativePath(
-          "12:cpu,cpuacct:/kubepods/pod123\n11:memory:/kubepods/pod123\n"),
+      CPUMon::parseCgroupRelativePath(
+          "12:cpu,cpuacct:/kubepods/pod123\n11:memory:/kubepods/pod123\n", ""),
       "");
 }
 
@@ -256,15 +257,65 @@ TEST_F(CPUMonTest, cgroupV2PathWithColon) {
   // A cgroup name may contain a colon, so the path is everything after the
   // second separator rather than the third field of a split.
   ASSERT_EQ(
-      CPUMon::parseCgroupV2RelativePath("0::/machine.slice/unit:name\n"),
+      CPUMon::parseCgroupRelativePath("0::/machine.slice/unit:name\n", ""),
       "/machine.slice/unit:name");
 }
 
 TEST_F(CPUMonTest, cgroupV2PathMissing) {
   for (const auto& content : {"", "\n", "garbage\n", "0:cpu\n"}) {
     SCOPED_TRACE(content);
-    ASSERT_EQ(CPUMon::parseCgroupV2RelativePath(content), "");
+    ASSERT_EQ(CPUMon::parseCgroupRelativePath(content, ""), "");
   }
+}
+
+// --------------------- cgroup v1 path from /proc/self ---------------------
+
+// A realistic '/proc/self/cgroup' on a cgroup v1 host, where 'cpu' and
+// 'cpuacct' are mounted together and the process sits in a nested cgroup.
+const char* kProcSelfCgroupV1 =
+    "11:memory:/kubepods/burstable/pod123\n"
+    "10:cpu,cpuacct:/kubepods/burstable/pod123/abc\n"
+    "9:cpuset:/kubepods/burstable/pod123\n";
+
+TEST_F(CPUMonTest, cgroupV1PathPerController) {
+  // Both controller names must resolve through the shared 'cpu,cpuacct' entry.
+  ASSERT_EQ(
+      CPUMon::parseCgroupRelativePath(kProcSelfCgroupV1, "cpu"),
+      "/kubepods/burstable/pod123/abc");
+  ASSERT_EQ(
+      CPUMon::parseCgroupRelativePath(kProcSelfCgroupV1, "cpuacct"),
+      "/kubepods/burstable/pod123/abc");
+}
+
+TEST_F(CPUMonTest, cgroupV1PathSeparateMounts) {
+  // 'cpu' and 'cpuacct' can be mounted separately, and then they may sit at
+  // different paths, so each has to be resolved against its own entry.
+  const char* procSelf =
+      "10:cpuacct:/kubepods/pod123/acct\n"
+      "9:cpu:/kubepods/pod123/quota\n";
+  ASSERT_EQ(
+      CPUMon::parseCgroupRelativePath(procSelf, "cpuacct"),
+      "/kubepods/pod123/acct");
+  ASSERT_EQ(
+      CPUMon::parseCgroupRelativePath(procSelf, "cpu"),
+      "/kubepods/pod123/quota");
+}
+
+TEST_F(CPUMonTest, cgroupV1PathControllerNotPresent) {
+  // A controller the process is not in must not fall through to another entry.
+  ASSERT_EQ(CPUMon::parseCgroupRelativePath(kProcSelfCgroupV1, "blkio"), "");
+  // 'cpu' must not match 'cpuset' by prefix, nor the v2 entry.
+  ASSERT_EQ(
+      CPUMon::parseCgroupRelativePath("9:cpuset:/kubepods/pod123\n", "cpu"),
+      "");
+  ASSERT_EQ(
+      CPUMon::parseCgroupRelativePath("0::/kubepods/pod123\n", "cpu"), "");
+}
+
+TEST_F(CPUMonTest, cgroupV1PathPrivateNamespace) {
+  // As with v2, a container that sees its own cgroup as the root reports '/'
+  // and there is nothing to append.
+  ASSERT_EQ(CPUMon::parseCgroupRelativePath("10:cpu,cpuacct:/\n", "cpu"), "");
 }
 
 } // namespace
