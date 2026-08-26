@@ -30,6 +30,7 @@
 #ifdef PRESTO_ENABLE_CUDF
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #endif
 
 namespace facebook::presto {
@@ -185,6 +186,21 @@ void registerConnectorFactories() {
   facebook::presto::registerConnectorFactory(
       std::make_shared<facebook::velox::connector::hive::iceberg::
                            IcebergConnectorFactory>());
+
+#ifdef PRESTO_ENABLE_CUDF
+  // Same swap as the Hive connector above: replace the CPU Iceberg factory with
+  // the cuDF one under the same connector name, so an existing 'iceberg'
+  // catalog runs its scans on the GPU with no configuration change. Without
+  // this the TableScan is rejected at canRunOnGPU with "connector is not
+  // CudfHiveConnector or CudfIcebergConnector", and because the scan gates
+  // everything downstream the whole plan falls back to CPU.
+  facebook::presto::unregisterConnectorFactory(
+      facebook::velox::connector::hive::iceberg::IcebergConnectorFactory::
+          kIcebergConnectorName);
+  facebook::presto::registerConnectorFactory(
+      std::make_shared<facebook::velox::cudf_velox::connector::hive::iceberg::
+                           CudfIcebergConnectorFactory>());
+#endif
 
 #ifdef PRESTO_ENABLE_ARROW_FLIGHT_CONNECTOR
   // Note: ArrowFlightConnectorFactory would need to be implemented in Presto
